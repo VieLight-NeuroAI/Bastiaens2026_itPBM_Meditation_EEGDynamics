@@ -1,0 +1,16 @@
+# Generated figures, tables, statistics, and source-pipeline caches
+outputs/
+
+# Unzipped data (distributed as Data.zip) and the FreeSurfer fsaverage5
+# template placed in Data/fsaverage5 (downloaded separately; see README)
+Data/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

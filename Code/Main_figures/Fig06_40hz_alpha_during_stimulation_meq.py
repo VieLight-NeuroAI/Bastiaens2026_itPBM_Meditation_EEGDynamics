@@ -1,0 +1,546 @@
+# ============================================================
+# Fig06_40hz_alpha_during_stimulation_meq.py
+#
+# Manuscript Figure 6 (Results 4.4):
+#   During-stimulation source relative alpha decreases during 40 Hz PBM
+#   are associated with subjective meditation experience.
+#
+# Panels:
+#   A. 40 Hz relative alpha trajectory colored by MEQ
+#   B. Descriptive median-split (high/low MEQ) trajectory
+#   C. Post-Dur20 and mean(Dur10_15_20) vs MEQ
+#   D. 40 Hz alpha feature-MEQ correlation summary
+#
+# Also exports the 40 Hz rows of Table 1 and the feature table read by
+#   Code/Supplementary/TableS2B_40hz_alpha_meq_robustness.py
+# (Table S2B: bootstrap CIs, permutation p values, leave-one-out and
+# influence diagnostics).
+#
+# Cond3 / 40 Hz uses the ZapLine-cleaned source features (Methods 3.3).
+#
+# Panel D error bars: 95% CI for Pearson r via Fisher z-transform
+# (uncorrected).
+#
+# Output files are prefixed "figure6_" / "Figure6_".
+# ============================================================
+
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import pearsonr, t, norm
+
+from pbm_paper_common import (
+    OUT_TABLES, OUT_STATS, OUT_FIGS,
+    BAND_SCHEME, MAX_DURING_WINDOWS, LATE_DURING_WINDOWS,
+    clean_subject_id, clean_condition, is_schaefer_brain_roi, roi_to_network,
+    load_score_table, fdr_bh, sem, savefig,
+)
+
+
+BAND = "Alpha"
+METRIC = "relative"
+NETWORK = "all_rois"
+CONDITION = "Cond3"
+CONDITION_LABEL = "40 Hz"
+SCORE_COL = "MEQ_Total"
+PRIMARY_FEATURE = "LateDuringMean_change"
+SCATTER_FEATURES = ["RecoveryFromD4", "LateDuringMean_change"]
+CONDITION_COLOR = "#D95F02"
+GROUP_COLORS = {"High score": "#1f77b4", "Low score": "#ff7f0e"}
+
+CI_ALPHA = 0.05
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_ROOT = PROJECT_ROOT / "Data"
+
+ZAPLINE_PRE_POST_FEATURES_CSV = (
+    DATA_ROOT
+    / "source_results"
+    / "source_band_power_40Hz"
+    / "source_roi_band_power_all_subjects_conditions_long.csv"
+)
+ZAPLINE_DURING_5MIN_FEATURES_CSV = (
+    DATA_ROOT
+    / "source_results"
+    / "source_band_power_40Hz"
+    / "during_5min_source_roi_band_power_all_subjects_conditions_long.csv"
+)
+
+
+KEY_FEATURES = [
+    "D1_change",
+    "LateDuringMean_change",
+    "D4_change",
+    "POST_change",
+    "RecoveryFromD4",
+    "ReboundIndex",
+]
+
+FEATURE_LABELS = {
+    "D1_change": "Dur5",
+    "D2_change": "Dur10",
+    "D3_change": "Dur15",
+    "D4_change": "Dur20",
+    "POST_change": "Post",
+    "LateDuringMean_change": "mean(Dur10_15_20)",
+    "RecoveryFromD4": "Post-Dur20",
+    "ReboundIndex": "Post-mean(Dur10_15_20)",
+}
+
+FEATURE_LABELS_PANEL_D = {
+    **FEATURE_LABELS,
+    "LateDuringMean_change": "mean\n(Dur10_15_20)",
+    "ReboundIndex": "Post-mean\n(Dur10_15_20)",
+}
+
+FEATURE_NOTE = (
+    "Dur5, Dur10, Dur15, Dur20, and Post are changes from PRE; "
+    "mean(Dur10_15_20)=mean(Dur10,Dur15,Dur20); Post-Dur20=Post minus Dur20.\n"
+    "Error bars are 95% CI for Pearson r (Fisher z-transform) and are uncorrected; "
+    "q values are Benjamini-Hochberg FDR-corrected across the six features shown.\n"
+    "Features are algebraically interdependent (e.g. Post-Dur20 = Post - Dur20), so these are not "
+    "independent tests; overlapping CIs mean features cannot be ranked by strength of association.\n"
+    "Bars not meeting the FDR threshold are shown semi-transparent."
+)
+
+OUT_DIR = OUT_FIGS / "figure6_40hz_alpha_mechanism"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def p_text(value):
+    if pd.isna(value):
+        return "NA"
+    if value < 0.001:
+        return "<0.001"
+    return f"{value:.3f}"
+
+
+def r_ci_fisher(r, n, alpha=CI_ALPHA):
+    """95% CI for Pearson r via the Fisher z-transform."""
+    if not np.isfinite(r) or n < 4:
+        return np.nan, np.nan
+    z = np.arctanh(r)
+    se = 1.0 / np.sqrt(n - 3)
+    crit = norm.ppf(1 - alpha / 2)
+    return np.tanh(z - crit * se), np.tanh(z + crit * se)
+
+
+def _load_zapline_source_csv(path, require_window=False):
+    if not path.exists():
+        raise FileNotFoundError(f"ZapLine source feature file not found:\n{path}")
+
+    df = pd.read_csv(path)
+    required = {"Subject", "Condition", "Phase", "ROI", "Band", "Metric", "Value", "BandScheme"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"ZapLine source feature file is missing required columns: {missing}")
+
+    for col in ["Subject", "Condition", "Phase", "ROI", "Band", "Metric", "BandScheme"]:
+        df[col] = df[col].astype(str).str.strip()
+
+    df["Subject"] = df["Subject"].apply(clean_subject_id)
+    df["Condition"] = df["Condition"].apply(clean_condition)
+    df["Phase"] = df["Phase"].astype(str).str.upper().str.strip()
+    df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
+    df = df[df["ROI"].apply(is_schaefer_brain_roi)].copy()
+    df["Network"] = df["ROI"].apply(roi_to_network)
+    df["FeatureSource"] = "ZapLine40_Cond3"
+
+    if require_window:
+        if "WindowIndex" not in df.columns:
+            raise ValueError("ZapLine DURING source feature file must contain WindowIndex.")
+        df["WindowIndex"] = pd.to_numeric(df["WindowIndex"], errors="coerce")
+        df = df.dropna(subset=["WindowIndex"]).copy()
+        df["WindowIndex"] = df["WindowIndex"].astype(int)
+        if MAX_DURING_WINDOWS is not None:
+            df = df[df["WindowIndex"] < MAX_DURING_WINDOWS].copy()
+
+    return df
+
+
+def build_zapline_trajectory_table():
+    whole = _load_zapline_source_csv(ZAPLINE_PRE_POST_FEATURES_CSV, require_window=False)
+    during = _load_zapline_source_csv(ZAPLINE_DURING_5MIN_FEATURES_CSV, require_window=True)
+
+    whole = whole[
+        (whole["Condition"] == CONDITION)
+        & (whole["Phase"].isin(["PRE", "POST"]))
+        & (whole["Band"] == BAND)
+        & (whole["Metric"] == METRIC)
+        & (whole["BandScheme"] == BAND_SCHEME)
+    ].copy()
+    during = during[
+        (during["Condition"] == CONDITION)
+        & (during["Phase"] == "DURING")
+        & (during["Band"] == BAND)
+        & (during["Metric"] == METRIC)
+        & (during["BandScheme"] == BAND_SCHEME)
+    ].copy()
+
+    if NETWORK != "all_rois":
+        whole = whole[whole["Network"] == NETWORK].copy()
+        during = during[during["Network"] == NETWORK].copy()
+
+    if whole.empty or during.empty:
+        raise RuntimeError("No ZapLine Cond3 rows were available after filtering.")
+
+    whole_phase = (
+        whole.groupby(["Subject", "Condition", "Phase"], as_index=False)["Value"]
+        .mean()
+        .rename(columns={"Value": "MeanSourcePower"})
+    )
+    whole_wide = whole_phase.pivot_table(
+        index=["Subject", "Condition"],
+        columns="Phase",
+        values="MeanSourcePower",
+        aggfunc="mean",
+    ).reset_index()
+    for phase in ["PRE", "POST"]:
+        if phase not in whole_wide.columns:
+            whole_wide[phase] = np.nan
+
+    during_phase = (
+        during.groupby(["Subject", "Condition", "WindowIndex"], as_index=False)["Value"]
+        .mean()
+        .rename(columns={"Value": "MeanSourcePower"})
+    )
+    window_indices = sorted(during_phase["WindowIndex"].dropna().unique().astype(int).tolist())
+    if MAX_DURING_WINDOWS is not None:
+        window_indices = [w for w in window_indices if w < MAX_DURING_WINDOWS]
+
+    during_wide = during_phase.pivot_table(
+        index=["Subject", "Condition"],
+        columns="WindowIndex",
+        values="MeanSourcePower",
+        aggfunc="mean",
+    ).reset_index()
+    during_wide = during_wide.rename(columns={idx: f"D{idx + 1}" for idx in window_indices})
+    during_cols = [f"D{idx + 1}" for idx in window_indices]
+
+    out = whole_wide.merge(during_wide, on=["Subject", "Condition"], how="inner")
+    if out.empty:
+        raise RuntimeError("ZapLine Cond3 PRE/POST and DURING rows did not overlap by subject.")
+
+    out["PRE_change"] = 0.0
+    for col in during_cols:
+        if col in out.columns:
+            out[f"{col}_change"] = out[col] - out["PRE"]
+
+    out["POST_change"] = out["POST"] - out["PRE"]
+    during_change_cols = [f"{c}_change" for c in during_cols if f"{c}_change" in out.columns]
+    late_cols = [f"{c}_change" for c in LATE_DURING_WINDOWS if f"{c}_change" in out.columns]
+
+    out["DURING_mean_change"] = out[during_change_cols].mean(axis=1)
+    out["LateDuringMean_change"] = out[late_cols].mean(axis=1)
+    out["DuringSuppression"] = -out["LateDuringMean_change"]
+    out["ReboundIndex"] = out["POST_change"] - out["LateDuringMean_change"]
+    out["RecoveryFromD4"] = out["POST_change"] - out["D4_change"] if "D4_change" in out.columns else np.nan
+
+    slope_cols = ["PRE_change"] + during_change_cols + ["POST_change"]
+
+    def slope(row):
+        y = np.array([row[c] for c in slope_cols], dtype=float)
+        x = np.arange(len(y), dtype=float)
+        mask = np.isfinite(y)
+        if mask.sum() < 2:
+            return np.nan
+        return np.polyfit(x[mask], y[mask], deg=1)[0]
+
+    out["Trajectory_slope"] = out.apply(slope, axis=1)
+    out["Band"] = BAND
+    out["Metric"] = METRIC
+    out["Network"] = NETWORK
+    out["BandScheme"] = BAND_SCHEME
+    out["FeatureSource"] = "ZapLine40_Cond3"
+
+    return out
+
+
+def add_regression_with_ci(ax, x, y, color="black"):
+    valid = pd.DataFrame({"x": x, "y": y}).dropna()
+    if len(valid) < 3:
+        return np.nan, np.nan, len(valid)
+    xv = valid["x"].to_numpy(dtype=float)
+    yv = valid["y"].to_numpy(dtype=float)
+    r, p = pearsonr(xv, yv)
+    if xv.min() == xv.max():
+        return r, p, len(valid)
+    coef = np.polyfit(xv, yv, deg=1)
+    xx = np.linspace(xv.min(), xv.max(), 200)
+    yy = coef[0] * xx + coef[1]
+    n = len(xv)
+    x_mean = xv.mean()
+    sxx = np.sum((xv - x_mean) ** 2)
+    residuals = yv - (coef[0] * xv + coef[1])
+    dof = n - 2
+    if dof > 0 and sxx > 0:
+        mse = np.sum(residuals ** 2) / dof
+        tcrit = t.ppf(0.975, dof)
+        se_fit = np.sqrt(mse * (1 / n + ((xx - x_mean) ** 2 / sxx)))
+        ci = tcrit * se_fit
+        ax.fill_between(xx, yy - ci, yy + ci, color="gray", alpha=0.22, linewidth=0)
+    ax.plot(xx, yy, color=color, linewidth=2.2)
+    return r, p, len(valid)
+
+
+def feature_correlations(df):
+    rows = []
+    for feature in KEY_FEATURES:
+        sub = df[[feature, "MeditationScore"]].dropna()
+        row = {
+            "Feature": feature,
+            "FeatureLabel": FEATURE_LABELS.get(feature, feature),
+            "N": len(sub),
+            "Pearson_r": np.nan,
+            "Pearson_p": np.nan,
+        }
+        if len(sub) >= 3:
+            row["Pearson_r"], row["Pearson_p"] = pearsonr(sub[feature], sub["MeditationScore"])
+        row["CI_low"], row["CI_high"] = r_ci_fisher(row["Pearson_r"], len(sub))
+        rows.append(row)
+    stats = pd.DataFrame(rows)
+    adj, reject = fdr_bh(stats["Pearson_p"].values, alpha=0.05)
+    stats["Pearson_p_FDR"] = adj
+    stats["Significant_FDR"] = reject
+    return stats
+
+
+features = build_zapline_trajectory_table()
+scores = load_score_table(score_col=SCORE_COL)
+merged = features.merge(scores, on=["Subject", "Condition"], how="inner")
+
+features.to_csv(OUT_TABLES / "figure6_40hz_zapline_alpha_features.csv", index=False)
+merged.to_csv(OUT_TABLES / "figure6_40hz_zapline_alpha_features_with_MEQ.csv", index=False)
+
+stats = feature_correlations(merged)
+stats.to_csv(OUT_STATS / "figure6_40hz_zapline_alpha_MEQ_feature_correlations.csv", index=False)
+
+print("Figure 6 40 Hz N:", merged["Subject"].nunique())
+print(stats.sort_values("Pearson_p"))
+
+# Primary feature, formatted for the manuscript sentence.
+# Bootstrap CI / permutation p / LOO come from
+# Code/Supplementary/TableS2B_40hz_alpha_meq_robustness.py
+prim = stats[stats["Feature"] == PRIMARY_FEATURE].iloc[0]
+print(
+    f"\nPRIMARY ({FEATURE_LABELS[PRIMARY_FEATURE]}): "
+    f"r={prim['Pearson_r']:.3f}, "
+    f"Fisher 95% CI [{prim['CI_low']:.3f}, {prim['CI_high']:.3f}], "
+    f"p={prim['Pearson_p']:.4f}, q={prim['Pearson_p_FDR']:.3f}, N={int(prim['N'])}"
+)
+
+
+time_cols = ["PRE_change", "D1_change", "D2_change", "D3_change", "D4_change", "POST_change"]
+time_labels = ["PRE", "Dur5", "Dur10", "Dur15", "Dur20", "Post"]
+time_cols = [c for c in time_cols if c in merged.columns]
+time_labels = [lab for lab, col in zip(time_labels, ["PRE_change", "D1_change", "D2_change", "D3_change", "D4_change", "POST_change"]) if col in time_cols]
+x = np.arange(len(time_cols))
+
+score_median = merged["MeditationScore"].median()
+merged["ScoreGroup"] = np.where(merged["MeditationScore"] >= score_median, "High score", "Low score")
+
+fig, axes = plt.subplots(
+    2,
+    2,
+    figsize=(20, 12),
+    gridspec_kw={"wspace": 0.18, "hspace": 0.25},
+)
+
+
+# Panel A
+ax = axes[0, 0]
+norm_color = plt.Normalize(merged["MeditationScore"].min(), merged["MeditationScore"].max())
+cmap = plt.cm.viridis
+for _, row in merged.iterrows():
+    ax.plot(
+        x,
+        [row[c] for c in time_cols],
+        marker="o",
+        linewidth=1.35,
+        alpha=0.78,
+        color=cmap(norm_color(row["MeditationScore"])),
+    )
+ax.errorbar(
+    x,
+    [merged[c].mean() for c in time_cols],
+    yerr=[sem(merged[c]) for c in time_cols],
+    marker="o",
+    linewidth=3,
+    capsize=5,
+    color="black",
+    label="Group mean +/- SEM",
+)
+ax.axhline(0, color="black", linestyle="--", linewidth=1)
+ax.set_xticks(x)
+ax.set_xticklabels(time_labels)
+ax.set_ylabel("Source alpha relative power change from PRE")
+ax.set_title("A. 40 Hz alpha trajectory colored by MEQ", pad=8)
+ax.grid(True, axis="y", alpha=0.25)
+ax.legend(frameon=False)
+cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm_color, cmap=cmap), ax=ax, fraction=0.046, pad=0.03)
+cbar.set_label(SCORE_COL)
+
+
+# Panel B
+ax = axes[0, 1]
+for group, g in merged.groupby("ScoreGroup"):
+    color = GROUP_COLORS.get(group, "gray")
+    for _, row in g.iterrows():
+        ax.plot(
+            x,
+            [row[c] for c in time_cols],
+            color=color,
+            alpha=0.13,
+            linewidth=1.0,
+            zorder=1,
+        )
+    ax.errorbar(
+        x,
+        [g[c].mean() for c in time_cols],
+        yerr=[sem(g[c]) for c in time_cols],
+        marker="o",
+        linewidth=3,
+        capsize=5,
+        color=color,
+        label=f"{group}, n={g['Subject'].nunique()}",
+        zorder=3,
+    )
+ax.axhline(0, color="black", linestyle="--", linewidth=1)
+ax.set_xticks(x)
+ax.set_xticklabels(time_labels)
+ax.set_ylabel("Change from PRE")
+ax.set_title("B. Descriptive high/low MEQ trajectory (no test)", pad=8)
+ax.grid(True, axis="y", alpha=0.25)
+ax.legend(frameon=False)
+
+
+# Panel C
+panel_c_spec = axes[1, 0].get_subplotspec()
+axes[1, 0].remove()
+c_axes = panel_c_spec.subgridspec(1, 2, wspace=0.14).subplots(sharey=True)
+score_values = merged["MeditationScore"].dropna().to_numpy(dtype=float)
+ypad = 0.05 * (score_values.max() - score_values.min()) if score_values.size else 1.0
+for idx, (ax, feature) in enumerate(zip(c_axes, SCATTER_FEATURES)):
+    feature_values = merged[feature].dropna().to_numpy(dtype=float)
+    xpad = 0.05 * (feature_values.max() - feature_values.min()) if feature_values.size else 0.01
+    if xpad == 0:
+        xpad = 0.01
+    ax.scatter(
+        merged[feature],
+        merged["MeditationScore"],
+        s=58,
+        alpha=0.86,
+        color=CONDITION_COLOR,
+        edgecolor="white",
+        linewidth=0.7,
+    )
+    r, p, n = add_regression_with_ci(ax, merged[feature], merged["MeditationScore"])
+    feature_row = stats[stats["Feature"] == feature].iloc[0]
+    ax.text(
+        0.05,
+        0.95,
+        f"r={r:.2f}\n95% CI [{feature_row['CI_low']:.2f}, {feature_row['CI_high']:.2f}]"
+        f"\np={p_text(p)}\nq={p_text(feature_row['Pearson_p_FDR'])}\nN={n}",
+        transform=ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=8,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.88),
+    )
+    ax.axvline(0, color="black", linestyle="--", linewidth=1)
+    ax.set_xlabel(FEATURE_LABELS[feature])
+    ax.set_xlim(feature_values.min() - xpad, feature_values.max() + xpad)
+    ax.set_ylim(score_values.min() - ypad, score_values.max() + ypad)
+    ax.grid(True, alpha=0.25)
+    if idx == 0:
+        ax.set_ylabel(SCORE_COL)
+    else:
+        ax.tick_params(labelleft=False)
+c_axes[0].set_title("")
+c_axes[1].set_title("")
+panel_c_pos = panel_c_spec.get_position(fig)
+fig.text(
+    (panel_c_pos.x0 + panel_c_pos.x1) / 2,
+    panel_c_pos.y1 + 0.012,
+    "C. MEQ-alpha feature comparisons",
+    ha="center",
+    va="bottom",
+    fontsize=12,
+)
+
+
+# Panel D
+ax = axes[1, 1]
+plot_stats = stats.copy()
+plot_stats["Feature"] = pd.Categorical(plot_stats["Feature"], KEY_FEATURES, ordered=True)
+plot_stats = plot_stats.sort_values("Feature")
+bar_x = np.arange(len(plot_stats))
+
+r_vals = plot_stats["Pearson_r"].to_numpy(dtype=float)
+ci_lo = plot_stats["CI_low"].to_numpy(dtype=float)
+ci_hi = plot_stats["CI_high"].to_numpy(dtype=float)
+
+# yerr must be DISTANCES from the bar top, shape (2, n): row 0 = downward, row 1 = upward
+yerr = np.vstack([r_vals - ci_lo, ci_hi - r_vals])
+yerr = np.clip(np.nan_to_num(yerr, nan=0.0), 0, None)
+
+bars = ax.bar(
+    bar_x,
+    r_vals,
+    color=CONDITION_COLOR,
+    yerr=yerr,
+    capsize=5,
+    error_kw=dict(ecolor="black", elinewidth=1.4, capthick=1.4),
+)
+
+# Bars not meeting the FDR threshold are drawn lighter, so the graphic matches
+# the q column rather than the (uncorrected) error bars.
+# NOTE: ax.bar(alpha=...) takes a scalar only, hence the per-bar set_alpha loop.
+survives = plot_stats["Significant_FDR"].to_numpy(dtype=bool)
+for bar, ok in zip(bars, survives):
+    bar.set_alpha(0.86 if ok else 0.38)
+
+ax.axhline(0, color="black", linestyle="--", linewidth=1)
+for i, row in enumerate(plot_stats.itertuples()):
+    if not np.isfinite(row.Pearson_r):
+        continue
+    star = "*" if bool(row.Significant_FDR) else ""
+    top = row.CI_high if np.isfinite(row.CI_high) else row.Pearson_r
+    bot = row.CI_low if np.isfinite(row.CI_low) else row.Pearson_r
+    if row.Pearson_r >= 0:
+        y_text, va = top + 0.04, "bottom"
+    else:
+        y_text, va = bot - 0.05, "top"
+    ax.text(
+        i,
+        y_text,
+        f"p={p_text(row.Pearson_p)}\nq={p_text(row.Pearson_p_FDR)}{star}",
+        ha="center",
+        va=va,
+        fontsize=8,
+    )
+ax.set_xticks(bar_x)
+ax.set_xticklabels([FEATURE_LABELS_PANEL_D[f] for f in plot_stats["Feature"]], rotation=25, ha="right")
+ax.set_ylabel(f"Pearson r with {SCORE_COL}")
+ax.set_ylim(-1.25, 1.25)
+ax.set_title("D. 40 Hz alpha feature-MEQ correlations", pad=8)
+ax.grid(True, axis="y", alpha=0.25)
+ax.text(
+    0.0,
+    -0.45,
+    FEATURE_NOTE,
+    transform=ax.transAxes,
+    ha="left",
+    va="top",
+    fontsize=8,
+)
+
+
+savefig(fig, OUT_DIR / "Figure6_40Hz_alpha_mechanism.png")
+
+print("\nDONE: Figure 6 40 Hz alpha mechanism.")
+print(f"Output folder:\n{OUT_DIR}")
